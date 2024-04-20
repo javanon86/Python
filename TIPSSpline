@@ -1,0 +1,217 @@
+import QuantLib as ql
+import csv
+from matplotlib import pyplot as plt
+from matplotlib.dates import YearLocator
+from matplotlib.ticker import PercentFormatter
+import pandas as pd
+
+
+def new_plot():
+    f = plt.figure(figsize=(8, 5))
+    ax = f.add_subplot(1, 1, 1)
+
+    ax.xaxis.grid(True, "major", color="lightgray")
+    ax.yaxis.grid(True, "major", color="lightgray")
+    ax.xaxis.set_major_locator(YearLocator(10))
+
+    return f, ax
+
+today = ql.Date(19, ql.April, 2024)
+ql.Settings.instance().evaluationDate = today
+
+def from_iso(date):
+    return ql.Date(date, "%Y-%m-%d")
+
+
+def apply_types(row):
+    return [
+        from_iso(row[0]),
+        from_iso(row[1]),
+        float(row[2]),
+        float(row[3]),
+    ]
+
+
+with open("Tips.csv") as f:
+    reader = csv.reader(f)
+    next(reader)  # skip header
+    data = [apply_types(row) for row in reader]
+data.sort(key=lambda r: r[1])
+
+tipsdb = pd.read_csv("Tips.csv")
+tipsdb.columns =['Start', 'Maturity', 'Coupon', 'Price']
+tipsdb.head()
+
+helpers = []
+bonds = []
+for start, maturity, coupon, price in data:
+    schedule = ql.Schedule(
+        start,
+        maturity,
+        ql.Period(1, ql.Years),
+        ql.TARGET(),
+        ql.ModifiedFollowing,
+        ql.ModifiedFollowing,
+        ql.DateGeneration.Backward,
+        False,
+    )
+    bond = ql.FixedRateBond(
+        3,
+        100.0,
+        schedule,
+        [coupon / 100.0],
+        ql.Actual360(),
+        ql.ModifiedFollowing,
+    )
+    bonds.append(bond)
+    helpers.append(ql.BondHelper(ql.QuoteHandle(ql.SimpleQuote(price)), bond))
+
+discount_curve = ql.RelinkableYieldTermStructureHandle()
+bond_engine = ql.DiscountingBondEngine(discount_curve)
+for b in bonds:
+    b.setPricingEngine(bond_engine)
+
+methods = {
+    "Nelson/Siegel": ql.NelsonSiegelFitting(),
+    "Exp. splines": ql.ExponentialSplinesFitting(True),
+    "B splines": ql.CubicBSplinesFitting(
+        [
+            -30.0,
+            -20.0,
+            0.0,
+            5.0,
+            10.0,
+            15.0,
+            20.0,
+            25.0,
+            30.0,
+            40.0,
+            50.0,
+        ],
+        True,
+    ),
+    "Svensson": ql.SvenssonFitting(),
+}
+
+tolerance = 1e-8
+max_iterations = 5000
+day_count = ql.Actual360()
+
+curves = {
+    tag: ql.FittedBondDiscountCurve(
+        today,
+        helpers,
+        day_count,
+        methods[tag],
+        tolerance,
+        max_iterations,
+    )
+    for tag in methods
+}
+
+f, ax = new_plot()
+ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+styles = iter(["-", "--", ":", "-."])
+
+dates = [today + ql.Period(i, ql.Months) for i in range(12 * 30 + 1)]
+
+for tag in curves:
+    rates = [
+        curves[tag].zeroRate(d, day_count, ql.Continuous).rate() for d in dates
+    ]
+    ax.plot_date(
+        [d.to_date() for d in dates],
+        rates,
+        next(styles),
+        label=tag,
+    )
+ax.legend(loc="best");
+
+quoted_prices = [row[-1] for row in data]
+
+
+def prices(tag):
+    discount_curve.linkTo(curves[tag])
+    return [b.cleanPrice() for b in bonds]
+
+
+def errors(tag):
+    return [q - p for p, q in zip(prices(tag), quoted_prices)]
+
+f, ax = new_plot()
+ps = prices("Svensson")
+qs = quoted_prices
+ax.plot_date(maturities, qs, "P", label="quoted")
+ax.plot_date(maturities, ps, "o", label="Svensson")
+ax.legend(loc="best")
+for m, p, q in zip(maturities, ps, qs):
+    ax.plot_date([m, m], [p, q], "-", color="grey")
+
+quoted_yields = [
+    b.bondYield(p, day_count, ql.Compounded, ql.Annual)
+    for b, p in zip(bonds, quoted_prices)
+]
+
+
+def yields(tag):
+    discount_curve.linkTo(curves[tag])
+    return [b.bondYield(day_count, ql.Compounded, ql.Annual) for b in bonds]
+
+
+f, ax = new_plot()
+ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+ys = yields("Svensson")
+qys = quoted_yields
+ax.plot_date(maturities, qys, ".", label="quoted")
+ax.plot_date(maturities, ys, "x", label="Svensson")
+ax.legend(loc="best");
+
+ys = yields("Svensson")
+qys = quoted_yields
+
+filtered_helpers = [
+    h for h, y1, y2 in zip(helpers, ys, qys) if abs(y1 - y2) < 0.005
+]
+
+curves["Svensson (new)"] = ql.FittedBondDiscountCurve(
+    today,
+    filtered_helpers,
+    day_count,
+    ql.SvenssonFitting(),
+    tolerance,
+    max_iterations,
+)
+
+f, ax = new_plot()
+ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+ys = yields("Svensson")
+ys2 = yields("Svensson (new)")
+qys = quoted_yields
+ax.plot_date(maturities, qys, ".", label="quoted")
+ax.plot_date(maturities, ys2, "x", label="Svensson (new)")
+ax.legend(loc="best");
+
+f, ax = new_plot()
+ps = prices("Svensson (new)")
+qs = quoted_prices
+ax.plot_date(maturities, qs, "P", label="quoted")
+ax.plot_date(maturities, ps, "o", label="Svensson (new)")
+ax.legend(loc="best")
+for m, p, q in zip(maturities, ps, qs):
+    ax.plot_date([m, m], [p, q], "-", color="grey")
+
+s1 = pd.Series([0.02652039704322815, 0.021863555574417118, 0.022023678922653202, 0.024394600439071656, 0.02427177205085755, 0.02449447808265686, 0.02210845800556934, 0.02211109805107117, 0.023543472719192514, 0.023698793172836304, 0.023597933528140283, 0.021959097719192515, 0.02200442888717092, 0.02280402201343027, 0.022864975214004518, 0.023000246198154023, 0.02328928999900818, 0.021517101043824587, 0.02179826521873475, 0.022298749399185185, 0.022339820173656072, 0.022672698259353648, 0.02118483242988587, 0.021886038923263552, 0.021226787675298578, 0.02190194649696351, 0.02146557503394299, 0.02200513832442782, 0.022171324722058842, 0.022992106866836552, 0.022402769136428836, 0.02258804890503702, 0.02467025579346462, 0.023599317955197967, 0.025037479162216193, 0.02519439732385356, 0.024900677251815807, 0.025099722011563963, 0.025032885789871222, 0.025045969775351593, 0.024894536638259898, 0.024716110154729503, 0.02477802428451569, 0.024697223367774322, 0.024581697017110556, 0.024164964056015023, 0.02393197531700135])
+s2 = pd.Series([0.024498571825027467, 0.024196037817001352, 0.02391574540138245, 0.023664270353317265, 0.023671007299423223, 0.023436713075637827, 0.023231848669052126, 0.023046198514394548, 0.022883574655636257, 0.022903785181045536, 0.022737859678268434, 0.022614354372024546, 0.022520679628297444, 0.022408265066146855, 0.022425945520401003, 0.022338992445517483, 0.02237024483680726, 0.02226852984428406, 0.02224166264533997, 0.022178644800186165, 0.02220326754944782, 0.02219105638278132, 0.022121445226669312, 0.022111936140060427, 0.022138207006454476, 0.022194262266159066, 0.022273817331911576, 0.02237535395622254, 0.022432134485244754, 0.022490704011917113, 0.02261693234463909, 0.022743113851547245, 0.022877917242050176, 0.024431460237503054, 0.024739323069275745, 0.02489232859611512, 0.024897195959091192, 0.025029840210957506, 0.02501515783306677, 0.02500783982276917, 0.024936199331283576, 0.024842865228652963, 0.024774354003096494, 0.024605099460136247, 0.02439245686531067, 0.024169815301895145, 0.023972187471389773])
+
+# Subtracting the series
+result = (s1 - s2)
+resultdb = result
+resultdb.columns= ['SS']
+# Display the result
+result
+
+data = {'col1': [maturity], 'col2': [result]}
+
+# Create a DataFrame from the dictionary
+df = pd.DataFrame(data)
+print(df)
